@@ -1191,7 +1191,7 @@ mod tests {
     use crate::internal::{
         consts, DirEntry, Header, ObjType, Timestamp, Version,
     };
-    use crate::{ReadLeNumber, WriteLeNumber};
+    use crate::{CreateStreamOptions, ReadLeNumber, WriteLeNumber};
 
     use super::CompoundFile;
 
@@ -1458,6 +1458,28 @@ mod tests {
         let mut cfb = CompoundFile::open(Cursor::new(cfb)).unwrap();
         let mut f = cfb.create_stream("stream").unwrap();
         f.write_all(&vec![0; 1024 * 1024]).unwrap();
+    }
+
+    #[test]
+    fn configurable_stream_buffer_size() {
+        use std::io::Write;
+
+        let mut buf = Vec::new();
+        let mut cfb =
+            CompoundFile::create(std::io::Cursor::new(&mut buf)).unwrap();
+
+        // Create a stream with a larger buffer to reduce flush frequency.
+        let options = CreateStreamOptions::default().buffer_size(256 * 1024);
+        let mut s = cfb.create_stream_with_options("/big", options).unwrap();
+        s.write_all(&vec![0u8; 1024 * 1024]).unwrap(); // 1 MiB
+        drop(s);
+
+        cfb.flush().unwrap();
+
+        // Re-open and validate length.
+        let mut cfb = CompoundFile::open(std::io::Cursor::new(buf)).unwrap();
+        let s = cfb.open_stream("/big").unwrap();
+        assert_eq!(s.len(), 1024 * 1024);
     }
 }
 
