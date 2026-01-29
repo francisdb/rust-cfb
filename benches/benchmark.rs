@@ -41,7 +41,7 @@ fn write_many_streams_disk(
     size: usize,
     stream_buffer_size: Option<usize>,
 ) {
-    let mut tmpfile = NamedTempFile::new().unwrap();
+    let tmpfile = NamedTempFile::new().unwrap();
     {
         let mut test_comp = CompoundFile::create(
             OpenOptions::new()
