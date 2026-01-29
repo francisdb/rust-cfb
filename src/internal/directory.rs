@@ -5,6 +5,7 @@ use crate::internal::{
 use crate::WriteLeNumber;
 use fnv::FnvHashSet;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::io::{self, Seek, SeekFrom, Write};
 
 //===========================================================================//
@@ -24,6 +25,9 @@ pub struct Directory<F> {
     allocator: Allocator<F>,
     dir_entries: Vec<DirEntry>,
     dir_start_sector: u32,
+    /// In-memory index for fast name lookups - maps (parent_id, name) to stream_id
+    /// This provides O(log n) lookups instead of O(n) tree traversal
+    name_index: BTreeMap<(u32, String), u32>,
 }
 
 impl<F> Directory<F> {
@@ -33,7 +37,20 @@ impl<F> Directory<F> {
         dir_start_sector: u32,
         validation: Validation,
     ) -> io::Result<Directory<F>> {
-        let directory = Directory { allocator, dir_entries, dir_start_sector };
+        // Build name index by traversing the tree structure
+        let mut name_index = BTreeMap::new();
+        if !dir_entries.is_empty() {
+            let mut visited = FnvHashSet::default();
+            build_name_index(
+                &dir_entries,
+                consts::ROOT_STREAM_ID,
+                &mut name_index,
+                &mut visited,
+            );
+        }
+
+        let directory =
+            Directory { allocator, dir_entries, dir_start_sector, name_index };
         directory.validate(validation)?;
         Ok(directory)
     }
@@ -57,18 +74,9 @@ impl<F> Directory<F> {
     pub fn stream_id_for_name_chain(&self, names: &[&str]) -> Option<u32> {
         let mut stream_id = consts::ROOT_STREAM_ID;
         for name in names.iter() {
-            stream_id = self.dir_entry(stream_id).child;
-            loop {
-                if stream_id == consts::NO_STREAM {
-                    return None;
-                }
-                let dir_entry = self.dir_entry(stream_id);
-                match internal::path::compare_names(name, &dir_entry.name) {
-                    Ordering::Equal => break,
-                    Ordering::Less => stream_id = dir_entry.left_sibling,
-                    Ordering::Greater => stream_id = dir_entry.right_sibling,
-                }
-            }
+            // Use the name index for O(log n) lookup instead of O(n) tree traversal
+            stream_id =
+                *self.name_index.get(&(stream_id, name.to_string()))?;
         }
         Some(stream_id)
     }
@@ -312,6 +320,9 @@ impl<F: Write + Seek> Directory<F> {
         }
         // TODO: rebalance tree
 
+        // Update the name index
+        self.name_index.insert((parent_id, name.to_string()), stream_id);
+
         // Write new entry to underyling file.
         self.write_dir_entry(stream_id)?;
         Ok(stream_id)
@@ -323,20 +334,50 @@ impl<F: Write + Seek> Directory<F> {
         parent_id: u32,
         name: &str,
     ) -> io::Result<()> {
-        // Find the directory entry with the given name below the parent.
+        // Find the directory entry with the given name using the index
+        let mut stream_id =
+            match self.name_index.get(&(parent_id, name.to_string())) {
+                Some(&id) => id,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Entry '{}' not found", name),
+                    ));
+                }
+            };
+
+        // Find path to this node for restructuring
         let mut stream_ids = Vec::new();
-        let mut stream_id = self.dir_entry(parent_id).child;
+        let mut current_id = self.dir_entry(parent_id).child;
         loop {
-            debug_assert_ne!(stream_id, consts::NO_STREAM);
-            debug_assert!(!stream_ids.contains(&stream_id));
-            stream_ids.push(stream_id);
-            let dir_entry = self.dir_entry(stream_id);
+            if current_id == consts::NO_STREAM {
+                break; // Entry not found in tree structure
+            }
+            stream_ids.push(current_id);
+            if current_id == stream_id {
+                break;
+            }
+            let dir_entry = self.dir_entry(current_id);
             match internal::path::compare_names(name, &dir_entry.name) {
+                Ordering::Less => current_id = dir_entry.left_sibling,
+                Ordering::Greater => current_id = dir_entry.right_sibling,
                 Ordering::Equal => break,
-                Ordering::Less => stream_id = dir_entry.left_sibling,
-                Ordering::Greater => stream_id = dir_entry.right_sibling,
             }
         }
+
+        // If we didn't find the node via tree traversal, it might be due to
+        // tree structure issues. Just ensure it's in the path.
+        if stream_ids.is_empty() || *stream_ids.last().unwrap() != stream_id {
+            // Can't safely remove if tree structure is inconsistent
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Cannot remove '{}': tree structure is inconsistent",
+                    name
+                ),
+            ));
+        }
+
         debug_assert_eq!(self.dir_entry(stream_id).child, consts::NO_STREAM);
 
         // Restructure the tree.
@@ -375,7 +416,9 @@ impl<F: Write + Seek> Directory<F> {
         // TODO: recolor nodes
 
         // Remove the entry.
-        debug_assert_eq!(stream_ids.last(), Some(&stream_id));
+        if let Some(&last_in_path) = stream_ids.last() {
+            debug_assert_eq!(last_in_path, stream_id);
+        }
         stream_ids.pop();
         if let Some(&sibling_id) = stream_ids.last() {
             if self.dir_entry(sibling_id).left_sibling == stream_id {
@@ -396,6 +439,21 @@ impl<F: Write + Seek> Directory<F> {
             let mut sector = self.seek_within_dir_entry(parent_id, 76)?;
             sector.write_le_u32(replacement_id)?;
         }
+
+        // Update the name index - remove the deleted entry
+        self.name_index.remove(&(parent_id, name.to_string()));
+
+        // Rebuild the entire index to handle any tree restructuring that occurred
+        // This is inefficient but ensures correctness
+        self.name_index.clear();
+        let mut visited = FnvHashSet::default();
+        build_name_index(
+            &self.dir_entries,
+            consts::ROOT_STREAM_ID,
+            &mut self.name_index,
+            &mut visited,
+        );
+
         self.free_dir_entry(stream_id)?;
         Ok(())
     }
@@ -498,6 +556,72 @@ impl<F: Write + Seek> Directory<F> {
     /// Flushes all changes to the underlying file.
     pub fn flush(&mut self) -> io::Result<()> {
         self.allocator.flush()
+    }
+}
+
+//===========================================================================//
+
+/// Recursively builds the name index by traversing the directory tree
+fn build_name_index(
+    dir_entries: &[DirEntry],
+    parent_id: u32,
+    index: &mut BTreeMap<(u32, String), u32>,
+    visited: &mut FnvHashSet<u32>,
+) {
+    let child_id = dir_entries[parent_id as usize].child;
+    if child_id != consts::NO_STREAM {
+        build_name_index_subtree(
+            dir_entries,
+            parent_id,
+            child_id,
+            index,
+            visited,
+        );
+    }
+}
+
+/// Helper to recursively traverse a subtree and build the name index
+fn build_name_index_subtree(
+    dir_entries: &[DirEntry],
+    parent_id: u32,
+    node_id: u32,
+    index: &mut BTreeMap<(u32, String), u32>,
+    visited: &mut FnvHashSet<u32>,
+) {
+    if node_id == consts::NO_STREAM {
+        return;
+    }
+
+    // Detect loops to prevent stack overflow
+    if visited.contains(&node_id) {
+        return;
+    }
+    visited.insert(node_id);
+
+    let entry = &dir_entries[node_id as usize];
+
+    // Add this node to the index
+    index.insert((parent_id, entry.name.clone()), node_id);
+
+    // Traverse left and right siblings
+    build_name_index_subtree(
+        dir_entries,
+        parent_id,
+        entry.left_sibling,
+        index,
+        visited,
+    );
+    build_name_index_subtree(
+        dir_entries,
+        parent_id,
+        entry.right_sibling,
+        index,
+        visited,
+    );
+
+    // Recursively build index for child storages
+    if entry.obj_type == ObjType::Storage && entry.child != consts::NO_STREAM {
+        build_name_index(dir_entries, node_id, index, visited);
     }
 }
 
