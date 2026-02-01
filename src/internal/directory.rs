@@ -6,7 +6,7 @@ use crate::WriteLeNumber;
 use fnv::FnvHashSet;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Seek, Write};
 
 //===========================================================================//
 
@@ -25,6 +25,8 @@ pub struct Directory<F> {
     allocator: Allocator<F>,
     dir_entries: Vec<DirEntry>,
     dir_start_sector: u32,
+    /// Cached directory chain sector IDs for O(1) entry access.
+    dir_sector_ids: Vec<u32>,
     /// In-memory index for fast name lookups - maps (parent_id, name) to stream_id
     /// This provides O(log n) lookups instead of O(n) tree traversal
     name_index: BTreeMap<(u32, String), u32>,
@@ -49,8 +51,16 @@ impl<F> Directory<F> {
             );
         }
 
-        let directory =
-            Directory { allocator, dir_entries, dir_start_sector, name_index };
+        let dir_sector_ids =
+            collect_dir_sector_ids(&allocator, dir_start_sector)?;
+
+        let directory = Directory {
+            allocator,
+            dir_entries,
+            dir_start_sector,
+            dir_sector_ids,
+            name_index,
+        };
         directory.validate(validation)?;
         Ok(directory)
     }
@@ -226,14 +236,19 @@ impl<F: Seek> Directory<F> {
     ) -> io::Result<Sector<'_, F>> {
         let dir_entries_per_sector =
             self.version().dir_entries_per_sector() as u32;
+        let sector_index_within_chain = stream_id / dir_entries_per_sector;
         let index_within_sector = stream_id % dir_entries_per_sector;
-        let mut directory_sector = self.dir_start_sector;
-        for _ in 0..(stream_id / dir_entries_per_sector) {
-            debug_assert_ne!(directory_sector, consts::END_OF_CHAIN);
-            directory_sector = self.allocator.next(directory_sector)?;
-        }
+        let sector_id = *self
+            .dir_sector_ids
+            .get(sector_index_within_chain as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory chain too short for entry",
+                )
+            })?;
         self.allocator.seek_within_subsector(
-            directory_sector,
+            sector_id,
             index_within_sector,
             consts::DIR_ENTRY_LEN,
             offset_within_dir_entry as u64,
@@ -473,7 +488,9 @@ impl<F: Write + Seek> Directory<F> {
         let unallocated_dir_entry = DirEntry::unallocated();
         if self.dir_entries.len() % dir_entries_per_sector == 0 {
             let start_sector = self.dir_start_sector;
-            self.allocator.extend_chain(start_sector, SectorInit::Dir)?;
+            let new_sector_id =
+                self.allocator.extend_chain(start_sector, SectorInit::Dir)?;
+            self.dir_sector_ids.push(new_sector_id);
             self.update_num_dir_sectors()?;
         }
         // Add a new entry to the end of the directory and return it.
@@ -545,12 +562,9 @@ impl<F: Write + Seek> Directory<F> {
     }
 
     fn write_dir_entry(&mut self, stream_id: u32) -> io::Result<()> {
-        let mut chain = self
-            .allocator
-            .open_chain(self.dir_start_sector, SectorInit::Dir)?;
-        let offset = (consts::DIR_ENTRY_LEN as u64) * (stream_id as u64);
-        chain.seek(SeekFrom::Start(offset))?;
-        self.dir_entries[stream_id as usize].write_to(&mut chain)
+        let entry = self.dir_entries[stream_id as usize].clone();
+        let mut sector = self.seek_within_dir_entry(stream_id, 0)?;
+        entry.write_to(&mut sector)
     }
 
     /// Flushes all changes to the underlying file.
@@ -748,3 +762,24 @@ mod tests {
 }
 
 //===========================================================================//
+
+/// Collects the directory chain sector IDs in order.
+fn collect_dir_sector_ids<F>(
+    allocator: &Allocator<F>,
+    dir_start_sector: u32,
+) -> io::Result<Vec<u32>> {
+    let mut sector_ids = Vec::new();
+    let mut current_sector_id = dir_start_sector;
+    let first_sector_id = dir_start_sector;
+    while current_sector_id != consts::END_OF_CHAIN {
+        sector_ids.push(current_sector_id);
+        current_sector_id = allocator.next(current_sector_id)?;
+        if current_sector_id == first_sector_id {
+            invalid_data!(
+                "Directory chain contained duplicate sector id {}",
+                current_sector_id
+            );
+        }
+    }
+    Ok(sector_ids)
+}
