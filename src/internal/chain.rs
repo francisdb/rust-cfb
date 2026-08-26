@@ -1,4 +1,4 @@
-use crate::internal::{consts, Allocator, Sector, SectorInit};
+use crate::internal::{consts, Allocator, SectorInit};
 use std::cmp;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
