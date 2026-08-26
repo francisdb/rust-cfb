@@ -37,42 +37,17 @@ impl<'a, F> Chain<'a, F> {
         self.sector_ids.first().copied().unwrap_or(consts::END_OF_CHAIN)
     }
 
+    /// The IDs of the sectors in this chain, in order.
+    pub fn sector_ids(&self) -> &[u32] {
+        &self.sector_ids
+    }
+
     pub fn num_sectors(&self) -> usize {
         self.sector_ids.len()
     }
 
     pub fn len(&self) -> u64 {
         (self.allocator.sector_len() as u64) * (self.sector_ids.len() as u64)
-    }
-}
-
-impl<'a, F: Seek> Chain<'a, F> {
-    pub fn into_subsector(
-        self,
-        subsector_index: u32,
-        subsector_len: usize,
-        offset_within_subsector: u64,
-    ) -> io::Result<Sector<'a, F>> {
-        debug_assert!(offset_within_subsector <= subsector_len as u64);
-        debug_assert_eq!(self.allocator.sector_len() % subsector_len, 0);
-        let subsectors_per_sector =
-            self.allocator.sector_len() / subsector_len;
-        let sector_index_within_chain =
-            subsector_index as usize / subsectors_per_sector;
-        let subsector_index_within_sector =
-            subsector_index % (subsectors_per_sector as u32);
-        let sector_id = *self
-            .sector_ids
-            .get(sector_index_within_chain)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid sector id")
-            })?;
-        self.allocator.seek_within_subsector(
-            sector_id,
-            subsector_index_within_sector,
-            subsector_len,
-            offset_within_subsector,
-        )
     }
 }
 
