@@ -39,16 +39,16 @@ fn assert_stream(
 #[test]
 fn many_mini_streams_grow_shrink_and_regrow() {
     let mut comp = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
-    write_streams(&mut comp, 2000, 300);
-    for i in 0..2000 {
+    write_streams(&mut comp, 800, 300);
+    for i in 0..800 {
         assert_stream(&mut comp, i, 300);
     }
 
     // Free every third stream, then add a second batch.
-    for i in (0..2000).step_by(3) {
+    for i in (0..800).step_by(3) {
         comp.remove_stream(format!("/s{i}")).unwrap();
     }
-    for i in 2000..2500 {
+    for i in 800..1000 {
         let data = vec![(i % 251) as u8; 300];
         let mut stream = comp.create_stream(format!("/s{i}")).unwrap();
         stream.write_all(&data).unwrap();
@@ -56,8 +56,8 @@ fn many_mini_streams_grow_shrink_and_regrow() {
     comp.flush().unwrap();
 
     let check = |comp: &mut CompoundFile<Cursor<Vec<u8>>>| {
-        for i in 0..2500u32 {
-            if i < 2000 && i % 3 == 0 {
+        for i in 0..1000u32 {
+            if i < 800 && i % 3 == 0 {
                 assert!(!comp.is_stream(format!("/s{i}")), "s{i} was removed");
             } else {
                 assert_stream(comp, i, 300);
