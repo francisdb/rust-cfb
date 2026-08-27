@@ -37,11 +37,11 @@ fn every_walked_name_resolves_and_removed_names_do_not() {
             .collect();
         assert!(walked.len() > 1500, "walked {} entries", walked.len());
         for (path, is_stream) in &walked {
-            assert!(comp.exists(path), "{path} exists");
+            assert!(comp.exists(path), "{} exists", path);
             assert_eq!(comp.is_stream(path), *is_stream, "{path} kind");
             assert_eq!(comp.is_storage(path), !*is_stream, "{path} kind");
             let other_case = path.to_uppercase();
-            assert!(comp.exists(&other_case), "{other_case} exists");
+            assert!(comp.exists(&other_case), "{} exists", other_case);
             assert_eq!(comp.is_stream(&other_case), *is_stream);
         }
         for i in (0..600).step_by(4) {

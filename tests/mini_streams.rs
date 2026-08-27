@@ -25,10 +25,11 @@ fn assert_stream(
         .unwrap()
         .read_to_end(&mut data)
         .unwrap();
-    assert_eq!(data.len(), len, "stream s{i} length");
+    assert_eq!(data.len(), len, "stream s{} length", i);
     assert!(
         data.iter().all(|&b| b == (i % 251) as u8),
-        "stream s{i} contents"
+        "stream s{} contents",
+        i
     );
 }
 
@@ -58,7 +59,11 @@ fn many_mini_streams_grow_shrink_and_regrow() {
     let check = |comp: &mut CompoundFile<Cursor<Vec<u8>>>| {
         for i in 0..1000u32 {
             if i < 800 && i % 3 == 0 {
-                assert!(!comp.is_stream(format!("/s{i}")), "s{i} was removed");
+                assert!(
+                    !comp.is_stream(format!("/s{i}")),
+                    "s{} was removed",
+                    i
+                );
             } else {
                 assert_stream(comp, i, 300);
             }
@@ -81,7 +86,7 @@ fn a_stream_crossing_the_mini_cutoff_keeps_its_neighbours_intact() {
     write_streams(&mut comp, 100, 200);
 
     let mut big = comp.create_stream("/big").unwrap();
-    big.write_all(&vec![7u8; 100]).unwrap();
+    big.write_all(&[7u8; 100]).unwrap();
     big.write_all(&vec![7u8; 10_000]).unwrap();
     big.set_len(50).unwrap();
     drop(big);
