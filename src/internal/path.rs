@@ -37,6 +37,16 @@ fn cfb_uppercase_char(c: char) -> char {
     case_mapper.simple_uppercase(c)
 }
 
+/// The key under which a name is indexed: two names get the same key
+/// exactly when `compare_names` calls them equal (same UTF-16 length, same
+/// characters once uppercased the CFB way).
+pub fn name_key(name: &str) -> (usize, String) {
+    (
+        name.encode_utf16().count(),
+        name.chars().map(cfb_uppercase_char).collect(),
+    )
+}
+
 /// Compares two directory entry names according to CFB ordering, which is
 /// case-insensitive, and which always puts shorter names before longer names,
 /// as encoded in UTF-16 (i.e. [shortlex

@@ -3,7 +3,7 @@ use crate::internal::{
     SectorInit, Timestamp, Validation, Version,
 };
 use crate::WriteLeNumber;
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use std::cmp::Ordering;
 use std::io::{self, Seek, SeekFrom, Write};
 
@@ -24,6 +24,11 @@ pub struct Directory<F> {
     allocator: Allocator<F>,
     dir_entries: Vec<DirEntry>,
     dir_start_sector: u32,
+    /// Every entry's stream ID by `(parent stream ID, name key)`. The
+    /// sibling tree is not kept balanced (many writers, this one included,
+    /// append to it), so walking it makes a lookup cost `O(siblings)`; the
+    /// index makes it `O(1)` whatever shape the tree is in.
+    name_index: FnvHashMap<(u32, (usize, String)), u32>,
 }
 
 impl<F> Directory<F> {
@@ -33,9 +38,61 @@ impl<F> Directory<F> {
         dir_start_sector: u32,
         validation: Validation,
     ) -> io::Result<Directory<F>> {
-        let directory = Directory { allocator, dir_entries, dir_start_sector };
+        let mut directory = Directory {
+            allocator,
+            dir_entries,
+            dir_start_sector,
+            name_index: FnvHashMap::default(),
+        };
         directory.validate(validation)?;
+        directory.build_name_index();
         Ok(directory)
+    }
+
+    /// Moves the index entries of the sibling tree rooted at `child` — the
+    /// children of one storage — from `old_parent` to `new_parent`.
+    fn rekey_children(
+        &mut self,
+        child: u32,
+        old_parent: u32,
+        new_parent: u32,
+    ) {
+        let mut stack = vec![child];
+        while let Some(stream_id) = stack.pop() {
+            if stream_id == consts::NO_STREAM {
+                continue;
+            }
+            let dir_entry = self.dir_entry(stream_id);
+            let key = internal::path::name_key(&dir_entry.name);
+            stack.push(dir_entry.left_sibling);
+            stack.push(dir_entry.right_sibling);
+            self.name_index.remove(&(old_parent, key.clone()));
+            self.name_index.insert((new_parent, key), stream_id);
+        }
+    }
+
+    /// Fills `name_index` from the sibling trees, visiting every entry once.
+    fn build_name_index(&mut self) {
+        let mut index = FnvHashMap::default();
+        let mut stack = vec![(consts::ROOT_STREAM_ID, consts::ROOT_STREAM_ID)];
+        while let Some((stream_id, parent_id)) = stack.pop() {
+            let dir_entry = self.dir_entry(stream_id);
+            if stream_id != consts::ROOT_STREAM_ID {
+                index.insert(
+                    (parent_id, internal::path::name_key(&dir_entry.name)),
+                    stream_id,
+                );
+            }
+            for sibling in [dir_entry.left_sibling, dir_entry.right_sibling] {
+                if sibling != consts::NO_STREAM {
+                    stack.push((sibling, parent_id));
+                }
+            }
+            if dir_entry.child != consts::NO_STREAM {
+                stack.push((dir_entry.child, stream_id));
+            }
+        }
+        self.name_index = index;
     }
 
     pub fn version(&self) -> Version {
@@ -57,18 +114,8 @@ impl<F> Directory<F> {
     pub fn stream_id_for_name_chain(&self, names: &[&str]) -> Option<u32> {
         let mut stream_id = consts::ROOT_STREAM_ID;
         for name in names.iter() {
-            stream_id = self.dir_entry(stream_id).child;
-            loop {
-                if stream_id == consts::NO_STREAM {
-                    return None;
-                }
-                let dir_entry = self.dir_entry(stream_id);
-                match internal::path::compare_names(name, &dir_entry.name) {
-                    Ordering::Equal => break,
-                    Ordering::Less => stream_id = dir_entry.left_sibling,
-                    Ordering::Greater => stream_id = dir_entry.right_sibling,
-                }
-            }
+            let key = (stream_id, internal::path::name_key(name));
+            stream_id = *self.name_index.get(&key)?;
         }
         Some(stream_id)
     }
@@ -197,6 +244,29 @@ impl<F> Directory<F> {
 }
 
 impl<F: Seek> Directory<F> {
+    pub fn seek_within_sector(
+        &mut self,
+        sector_id: u32,
+        offset_within_sector: u64,
+    ) -> io::Result<Sector<'_, F>> {
+        self.allocator.seek_within_sector(sector_id, offset_within_sector)
+    }
+
+    pub fn seek_within_subsector(
+        &mut self,
+        sector_id: u32,
+        subsector_index_within_sector: u32,
+        subsector_len: usize,
+        offset_within_subsector: u64,
+    ) -> io::Result<Sector<'_, F>> {
+        self.allocator.seek_within_subsector(
+            sector_id,
+            subsector_index_within_sector,
+            subsector_len,
+            offset_within_subsector,
+        )
+    }
+
     pub fn seek_within_header(
         &mut self,
         offset_within_header: u64,
@@ -311,6 +381,8 @@ impl<F: Write + Seek> Directory<F> {
             }
         }
         // TODO: rebalance tree
+        self.name_index
+            .insert((parent_id, internal::path::name_key(name)), stream_id);
 
         // Write new entry to underyling file.
         self.write_dir_entry(stream_id)?;
@@ -338,6 +410,7 @@ impl<F: Write + Seek> Directory<F> {
             }
         }
         debug_assert_eq!(self.dir_entry(stream_id).child, consts::NO_STREAM);
+        self.name_index.remove(&(parent_id, internal::path::name_key(name)));
 
         // Restructure the tree.
         let mut replacement_id = consts::NO_STREAM;
@@ -369,6 +442,14 @@ impl<F: Write + Seek> Directory<F> {
             pred_entry.left_sibling = left_sibling;
             pred_entry.right_sibling = right_sibling;
             pred_entry.write_to(&mut self.seek_to_dir_entry(stream_id)?)?;
+            // The predecessor now lives in this slot; its old slot is the
+            // one that ends up freed. If it is a storage, its children were
+            // indexed under the old slot and follow it.
+            self.name_index.insert(
+                (parent_id, internal::path::name_key(&pred_entry.name)),
+                stream_id,
+            );
+            self.rekey_children(pred_entry.child, predecessor_id, stream_id);
             *self.dir_entry_mut(stream_id) = pred_entry;
             stream_id = predecessor_id;
         }
